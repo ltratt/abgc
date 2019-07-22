@@ -1,0 +1,5 @@
+[workspace]
+members=[
+    "abgc",
+    "abgc_derive"
+]
