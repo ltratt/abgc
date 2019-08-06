@@ -15,8 +15,7 @@
 
 use std::{
     alloc::{alloc, dealloc, Layout},
-    marker::PhantomData,
-    mem::{forget, size_of},
+    mem::{align_of, forget, size_of},
     ops::Deref,
     ptr,
 };
@@ -30,75 +29,101 @@ pub trait GcLayout {
 
 #[derive(Debug)]
 pub struct Gc<T: GcLayout> {
-    ptr: *mut GcBox<T>,
+    objptr: *mut T,
 }
 
 impl<T: GcLayout> Gc<T> {
     /// Create a `Gc` from `v`.
     pub fn new(v: T) -> Self {
-        let (gcbptr, vptr): (_, *mut T) = GcBox::<T>::alloc_blank(Layout::new::<T>());
+        let objptr = Gc::<T>::alloc_blank(Layout::new::<T>());
         let gc = unsafe {
-            vptr.copy_from_nonoverlapping(&v, 1);
-            Gc::from_raw(gcbptr)
+            objptr.copy_from_nonoverlapping(&v, 1);
+            Gc::from_raw(objptr)
         };
         forget(v);
         gc
     }
 
+    /// Allocate memory sufficient to `l` (i.e. correctly aligned and of at least the required
+    /// size). The returned pointer must be passed to `Gc::from_raw`.
+    pub fn alloc_blank(l: Layout) -> *mut T {
+        let (layout, uoff) = Layout::new::<usize>().extend(l).unwrap();
+        // In order for our storage scheme to work, it's necessary that `uoff - sizeof::<usize>()`
+        // gives a valid alignment for a `usize`. There are only two cases we need to consider
+        // here:
+        //   1) `object`'s alignment is smaller than or equal to `usize`. If so, no padding will be
+        //      added, at which point by definition `uoff - sizeof::<usize>()` will be exactly
+        //      equivalent to the start point of the layout.
+        //   2) `object`'s alignment is bigger than `usize`. Since alignment must be a power of
+        //      two, that means that we must by definition be adding at least one exact multiple of
+        //      `usize` bytes of padding.
+        // The assert below is thus paranoia writ large: it could only trigger if `Layout` started
+        // adding amounts of padding that directly contradict the documentation.
+        debug_assert_eq!(uoff % align_of::<usize>(), 0);
+
+        unsafe {
+            let baseptr = alloc(layout);
+            let objptr = baseptr.add(uoff);
+            let clonesptr = objptr.sub(size_of::<usize>());
+            ptr::write(clonesptr as *mut usize, 1);
+            objptr as *mut T
+        }
+    }
+
     /// Consumes the `Gc` returning a pointer which can be later used to recreate a `Gc` using
     /// either `from_raw` or `clone_from_raw`. Failing to recreate the `Gc` will lead to a memory
     /// leak.
-    pub fn into_raw(self) -> *const GcBox<T> {
-        let ptr = self.ptr;
+    pub fn into_raw(self) -> *const T {
+        let objptr = self.objptr;
         forget(self);
-        ptr
+        objptr
     }
 
     /// Create a `Gc` from a raw pointer previously created by `alloc_blank` or `into_raw`. Note
     /// that this does not increment the reference count.
-    pub unsafe fn from_raw(ptr: *const GcBox<T>) -> Self {
+    pub unsafe fn from_raw(objptr: *const T) -> Self {
         Gc {
-            ptr: ptr as *mut GcBox<T>,
+            objptr: objptr as *mut T,
         }
     }
 
     /// Create a `Gc` from a raw pointer previously created by `into_raw`, incrementing the
     /// reference count at the same time.
-    pub unsafe fn clone_from_raw(ptr: *const GcBox<T>) -> Self {
-        (*(ptr as *mut GcBox<T>)).clones += 1;
+    pub unsafe fn clone_from_raw(objptr: *const T) -> Self {
+        let clonesptr = (objptr as *mut u8).sub(size_of::<usize>()) as *mut usize;
+        let clones = ptr::read(clonesptr);
+        ptr::write(clonesptr, clones + 1);
         Gc {
-            ptr: ptr as *mut GcBox<T>,
+            objptr: objptr as *mut T,
         }
     }
 
     /// Recreate the `Gc<T>` pointing to `valptr`. If `valptr` was not originally directly created
     /// by `Gc`/`GcBox` then undefined behaviour will result.
-    pub unsafe fn recover(valptr: *const T) -> Self {
-        Gc::clone_from_raw(GcBox::recover(valptr))
+    pub unsafe fn recover(objptr: *const T) -> Self {
+        Gc::clone_from_raw(objptr)
     }
 
     /// Clone the GC object `gcc`. Note that this is an associated method.
     pub fn clone(gcc: &Gc<T>) -> Self {
-        unsafe { &mut *gcc.ptr }.clones += 1;
-        Gc { ptr: gcc.ptr }
+        unsafe {
+            let clonesptr = (gcc.objptr as *mut u8).sub(size_of::<usize>()) as *mut usize;
+            let clones = ptr::read(clonesptr);
+            ptr::write(clonesptr, clones + 1);
+        }
+        Gc { objptr: gcc.objptr }
     }
 
     /// Is `this` pointer equal to `other`?
     pub fn ptr_eq(this: &Gc<T>, other: &Gc<T>) -> bool {
         ptr::eq(this.deref(), other.deref())
     }
-}
 
-impl<T: GcLayout> Drop for Gc<T> {
-    fn drop(&mut self) {
-        let clones = unsafe { &*self.ptr }.clones;
-        if clones == 1 {
-            unsafe {
-                ptr::drop_in_place(self.ptr);
-                dealloc(self.ptr as *mut u8, self.layout());
-            }
-        } else {
-            unsafe { &mut *self.ptr }.clones -= 1;
+    #[cfg(test)]
+    fn clones(&self) -> usize {
+        unsafe {
+            let clonesptr = (self.objptr as *mut u8).sub(size_of::<usize>()) as *mut usize;
+            ptr::read(clonesptr)
         }
     }
 }
@@ -107,61 +132,24 @@ impl<T: GcLayout> Deref for Gc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        unsafe { &*self.ptr }.deref()
+        unsafe { &*(self.objptr as *const T) }
     }
 }
 
-#[derive(Debug)]
-pub struct GcBox<T> {
-    clones: usize,
-    phantom: PhantomData<T>,
-    // The GcBox is followed by the actual contents of the object itself. In other words, on a 64
-    // bit machine the layout is:
-    //   0..7: clones
-    //   8.. : object
-}
-
-impl<T: GcLayout> GcBox<T> {
-    /// Allocate a `GcBox` with enough size to store `l`, returning a tuple whose first element
-    /// must later be passed to `GcBox::from_raw` and whose second element is a raw pointer to
-    /// storage sufficient to store `l`.
-    #[allow(clippy::cast_ptr_alignment)]
-    pub fn alloc_blank(l: Layout) -> (*mut Self, *mut T) {
-        let (layout, valoff) = Layout::new::<GcBox<T>>().extend(l).unwrap();
-        debug_assert_eq!(valoff, size_of::<GcBox<T>>());
-        let gcbptr = unsafe { alloc(layout) as *mut Self };
-        if gcbptr.is_null() {
-            panic!("Can't allocate memory.");
-        }
-        unsafe { &mut *gcbptr }.clones = 1;
-        let valptr = unsafe { (gcbptr as *mut u8).add(valoff) } as *mut T;
-        (gcbptr, valptr)
-    }
-
-    /// Recreate the `GcBox<T>` pointing to `valptr`. If `valptr` was not originally directly
-    /// created by `GcBox` then undefined behaviour will result.
-    pub unsafe fn recover(valptr: *const T) -> *mut GcBox<T> {
-        (valptr as *const u8).sub(size_of::<GcBox<T>>()) as *mut GcBox<T>
-    }
-}
-
-impl<T: GcLayout> Deref for GcBox<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        unsafe {
-            let valptr =
-                (self as *const GcBox<T> as *const u8).add(size_of::<GcBox<T>>()) as *const T;
-            &*valptr
-        }
-    }
-}
-
-impl<T> Drop for GcBox<T> {
+impl<T: GcLayout> Drop for Gc<T> {
     fn drop(&mut self) {
+        let t_layout = self.layout();
         unsafe {
-            let valptr = (self as *mut GcBox<T> as *mut u8).add(size_of::<GcBox<T>>()) as *mut T;
-            ptr::drop_in_place(valptr);
+            let clonesptr = (self.objptr as *mut u8).sub(size_of::<usize>()) as *mut usize;
+            let clones = ptr::read(clonesptr);
+            if clones == 1 {
+                ptr::drop_in_place(self.objptr);
+                let (layout, uoff) = Layout::new::<usize>().extend(t_layout).unwrap();
+                let baseptr = (self.objptr as *mut u8).sub(uoff);
+                dealloc(baseptr, layout);
+            } else {
+                ptr::write(clonesptr, clones - 1)
+            }
         }
     }
 }
@@ -185,12 +173,12 @@ mod tests {
     #[test]
     fn test_gc_new() {
         let v1 = Gc::new(42);
-        assert_eq!(unsafe { (&*v1.ptr) }.clones, 1);
+        assert_eq!(v1.clones(), 1);
         {
             let v2 = Gc::clone(&v1);
-            assert_eq!(unsafe { (&*v1.ptr) }.clones, 2);
-            assert_eq!(unsafe { (&*v2.ptr) }.clones, 2);
+            assert_eq!(v1.clones(), 2);
+            assert_eq!(v2.clones(), 2);
         }
-        assert_eq!(unsafe { (&*v1.ptr) }.clones, 1);
+        assert_eq!(v1.clones(), 1);
     }
 }
