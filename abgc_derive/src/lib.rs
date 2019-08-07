@@ -21,7 +21,7 @@ pub fn gclayout_derive(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         impl #impl_generics ::abgc::GcLayout for #ident #ty_generics #where_clause {
             fn layout(&self) -> ::std::alloc::Layout {
-                ::std::alloc::Layout::new::<#ident<#ty_generics>>()
+                ::std::alloc::Layout::new::<#ident #ty_generics>()
             }
         }
     };
